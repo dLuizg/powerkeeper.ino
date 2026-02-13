@@ -3,428 +3,612 @@
 #include <Firebase_ESP_Client.h>
 #include <time.h>
 
-// ---------- CONFIGURAÇÕES ----------
-EnergyMonitor SCT013;
+// ============================================================================
+// CONFIGURATION & CONSTANTS
+// ============================================================================
 
-const char* ssid = "Augusto";
-const char* password = "internet100";
+// Network Configuration
+const char *WIFI_SSID = "Augusto";
+const char *WIFI_PASSWORD = "internet100";
+const unsigned long WIFI_TIMEOUT_MS = 10000;
 
-const int idDispositivo = 1;
-const int pinSCT = 35;
-#define BOTAO 14
-
-#define LED_220V 25
-#define LED_127V 26
-#define LED_OFF 27
-
-// ---------- FIREBASE ----------
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
-
-// Seu host e auth, mantidos inalterados
+// Firebase Configuration
 #define FIREBASE_HOST "https://powerkeeper-synatec-default-rtdb.firebaseio.com/"
-// CHAVE ATUALIZADA COM O VALOR FORNECIDO PELO USUÁRIO
 #define FIREBASE_AUTH "gNcMVY25PGjzd1If4GX7OZiLENZsnxehj1JYmaRv"
 
-// ---------- VARIÁVEIS ----------
-int tensao = 127;
-int estadoBotaoAnterior = HIGH;
-int contadorTensao = 0; // Mantido o nome original para consistência
+// Hardware Pin Definitions
+const int PIN_SCT_SENSOR = 35;
+const int PIN_BUTTON = 14;
+const int PIN_LED_220V = 25;
+const int PIN_LED_127V = 26;
+const int PIN_LED_OFF = 27;
 
-unsigned long intervaloLeitura = 1000;
-unsigned long ultimoLeitura = 0;
+// Device Configuration
+const int DEVICE_ID = 1;
+const float CURRENT_CALIBRATION = 1.45;
+const int ADC_SAMPLES = 2048;
 
-unsigned long intervaloFirebase = 5000;
-unsigned long ultimoFirebase = 0;
+// Timing Constants
+const unsigned long READING_INTERVAL_MS = 1000;
+const unsigned long FIREBASE_INTERVAL_MS = 5000;
+const unsigned long LED_OFF_DURATION_MS = 10000;
 
-double Irms = 0.0;
+// Energy Calculation Constants
+const double NOISE_THRESHOLD_AMPS = 0.16;
+const double MICROS_PER_HOUR = 3600000000.0;
+const double WH_TO_KWH = 1000.0;
 
-unsigned long long ultimoTempoMicro = 0;
+// Time Configuration
+const long TIMEZONE_OFFSET_SECONDS = -3 * 3600; // UTC-3
+const time_t MIN_VALID_TIMESTAMP = 1609459200;  // Jan 1, 2021
 
-double energia_Wh = 0.0;
-double consumoAtual_kWh = 0.0;
-double consumoOntem_kWh = 0.0;
+// Voltage States
+enum VoltageMode
+{
+    VOLTAGE_127V = 0,
+    VOLTAGE_220V = 1,
+    VOLTAGE_OFF = 2,
+    VOLTAGE_MODE_COUNT = 3
+};
 
-int diaAtual = -1;
+// ============================================================================
+// GLOBAL OBJECTS & STATE
+// ============================================================================
 
-unsigned long contadorLeitura = 1;
+// Hardware Objects
+EnergyMonitor currentSensor;
+FirebaseData firebaseData;
+FirebaseAuth firebaseAuth;
+FirebaseConfig firebaseConfig;
 
-bool vermelhoDesligando = false; // Mantido o nome original para consistência
-unsigned long tempoDesligamentoVermelho = 0; // Mantido o nome original para consistência
+// Voltage Control State
+VoltageMode currentVoltageMode = VOLTAGE_127V;
+int currentVoltageValue = 127;
+int previousButtonState = HIGH;
 
-// Controle de fechamento (evita duplicação)
-String ultimaDataFechada = "";
+// Energy Measurement State
+double currentRMS = 0.0;
+double energyAccumulator_Wh = 0.0;
+double todayConsumption_kWh = 0.0;
+double yesterdayConsumption_kWh = 0.0;
+unsigned long long lastMicros = 0;
 
-// ---------- PROTÓTIPOS ----------
-String gerarTimestampISO();      // "YYYY-MM-DD HH:MM:SS"
-String getDataHoje();           // "YYYY-MM-DD"
-void conectarWiFi();
-void alternarTensao();
-void atualizarLEDs();
-void atualizarEnergia();
-void enviarDadosFirebase();
-void verificarViradaDia();
-void fechamentoDiario(double consumoDia_kWh);
-void fechamentoRetroativoAoIniciar();
-void esperarSincronizacaoNTP();
+// Timing State
+unsigned long lastReadingTime = 0;
+unsigned long lastFirebaseTime = 0;
+unsigned long ledOffStartTime = 0;
+bool isLedOffTimerActive = false;
 
-// ---------- IMPLEMENTAÇÕES ----------
+// Day Tracking State
+int currentDayOfMonth = -1;
+String lastClosedDate = "";
+unsigned long readingCounter = 1;
 
-// Retorna o timestamp no formato ISO "YYYY-MM-DD HH:MM:SS"
-String gerarTimestampISO() {
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
-    char buffer[25];
-    sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
-            t->tm_year + 1900,
-            t->tm_mon + 1,
-            t->tm_mday,
-            t->tm_hour,
-            t->tm_min,
-            t->tm_sec);
-    return String(buffer);
-}
+// ============================================================================
+// FUNCTION DECLARATIONS
+// ============================================================================
 
-// Retorna a data de hoje no formato "YYYY-MM-DD"
-String getDataHoje() {
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
-    char buffer[12];
-    sprintf(buffer, "%04d-%02d-%02d",
-            t->tm_year + 1900,
-            t->tm_mon + 1,
-            t->tm_mday);
-    return String(buffer);
-}
+// Initialization Functions
+void setupHardware();
+void setupWiFi();
+void setupTimeSync();
+void setupFirebase();
 
-// Função para esperar a sincronização do NTP (evita 1970)
-void esperarSincronizacaoNTP() {
-    Serial.print("Aguardando sincronizacao NTP");
-    time_t now = time(nullptr);
-    // Tempo maior que 2021 (1609459200) como indicador de sincronização.
-    while (now < 1609459200) { 
-        delay(500);
-        now = time(nullptr);
-        Serial.print(".");
-    }
-    Serial.println("\nNTP sincronizado com sucesso!");
-}
+// Time Functions
+void waitForNTPSync();
+String getCurrentTimestamp(); // "YYYY-MM-DD HH:MM:SS"
+String getCurrentDate();      // "YYYY-MM-DD"
+String getYesterdayDate();
+int getCurrentDay();
 
-// ---------- SETUP ----------
-void setup() {
+// Hardware Control Functions
+void handleButtonPress();
+void updateVoltageMode();
+void updateLEDIndicators();
+void updateLEDOffTimer();
+
+// Energy Measurement Functions
+void measureEnergy();
+double calculatePower();
+
+// Firebase Functions
+void sendReadingToFirebase();
+void sendDailyClosingToFirebase(double consumption_kWh);
+bool readLastClosedDateFromFirebase();
+void updateLastClosedDateMarker(const String &date);
+
+// Day Management Functions
+void checkForDayRollover();
+void performDailyClosing(double consumption_kWh);
+void performRetroactiveClosing();
+
+// Utility Functions
+int getVoltageValue(VoltageMode mode);
+bool isWiFiConnected();
+bool isFirebaseReady();
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup()
+{
     Serial.begin(115200);
     delay(50);
+    Serial.println("\n=== PowerKeeper System Starting ===");
 
-    // iniciais
-    SCT013.current(pinSCT, 1.45);   // fator calibração
-    pinMode(BOTAO, INPUT_PULLUP);
-    pinMode(LED_220V, OUTPUT);
-    pinMode(LED_127V, OUTPUT);
-    pinMode(LED_OFF, OUTPUT);
-    atualizarLEDs();
+    setupHardware();
+    setupWiFi();
 
-    conectarWiFi();
+    if (isWiFiConnected())
+    {
+        setupTimeSync();
+        currentDayOfMonth = getCurrentDay();
+        Serial.printf("System start time: %s\n", getCurrentTimestamp().c_str());
 
-    // NTP (fuso -3)
-    configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        esperarSincronizacaoNTP(); // <--- CHAMA A FUNÇÃO DE ESPERA AQUI
-
-        // registra dia atual APÓS a sincronização
-        time_t now = time(nullptr);
-        struct tm* t = localtime(&now);
-        diaAtual = t->tm_mday;
-        Serial.printf("Data e hora de inicio: %s\n", gerarTimestampISO().c_str());
-
-        // Refatoração: Centralizando a inicialização do Firebase aqui.
-        Serial.println("Configurando Firebase...");
-        config.database_url = FIREBASE_HOST;
-        config.signer.tokens.legacy_token = FIREBASE_AUTH;
-        Firebase.begin(&config, &auth);
-        Firebase.reconnectWiFi(true);
-        Serial.println("Firebase conectado!");
-
-        // tenta fechar retroativamente caso necessário
-        fechamentoRetroativoAoIniciar();
-    } else {
-        Serial.println("WiFi não conectado — inicializando sem Firebase (prototipo).");
-        // Ainda tenta registrar o dia, mesmo que o NTP possa não ter funcionado
-        time_t now = time(nullptr);
-        struct tm* t = localtime(&now);
-        diaAtual = t->tm_mday;
+        setupFirebase();
+        performRetroactiveClosing();
     }
-    
-    ultimoTempoMicro = micros();
+    else
+    {
+        Serial.println("WiFi unavailable - running in offline mode");
+        currentDayOfMonth = getCurrentDay();
+    }
+
+    lastMicros = micros();
+    Serial.println("=== System Ready ===\n");
 }
 
-// ---------- LOOP ----------
-void loop() {
-    unsigned long agora = millis();
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
 
-    alternarTensao();
-    verificarViradaDia();
+void loop()
+{
+    handleButtonPress();
+    checkForDayRollover();
+    updateLEDOffTimer();
 
-    // controle LED OFF temporizado (10s)
-    if (vermelhoDesligando && (agora - tempoDesligamentoVermelho >= 10000UL)) {
-        digitalWrite(LED_OFF, LOW);
-        vermelhoDesligando = false;
+    // Periodic energy measurement
+    if (millis() - lastReadingTime >= READING_INTERVAL_MS)
+    {
+        lastReadingTime = millis();
+        measureEnergy();
     }
 
-    // leitura a cada 1s
-    if (agora - ultimoLeitura >= intervaloLeitura) {
-        ultimoLeitura = agora;
-        atualizarEnergia();
-    }
-
-    // envio ao Firebase a cada intervaloFirebase
-    if (agora - ultimoFirebase >= intervaloFirebase) {
-        ultimoFirebase = agora;
-        if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-            enviarDadosFirebase();
-        } else if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Tentando enviar, mas WiFi desconectado.");
+    // Periodic Firebase updates
+    if (millis() - lastFirebaseTime >= FIREBASE_INTERVAL_MS)
+    {
+        lastFirebaseTime = millis();
+        if (isWiFiConnected() && isFirebaseReady())
+        {
+            sendReadingToFirebase();
+        }
+        else if (!isWiFiConnected())
+        {
+            Serial.println("Skipping Firebase update - WiFi disconnected");
         }
     }
 }
 
-// ---------- FUNÇÕES PRINCIPAIS ----------
-void alternarTensao() {
-    int estadoBotaoAtual = digitalRead(BOTAO);
+// ============================================================================
+// INITIALIZATION IMPLEMENTATIONS
+// ============================================================================
 
-    if (estadoBotaoAnterior == HIGH && estadoBotaoAtual == LOW) {
-        contadorTensao++;
-        if (contadorTensao > 2) contadorTensao = 0;
+void setupHardware()
+{
+    currentSensor.current(PIN_SCT_SENSOR, CURRENT_CALIBRATION);
 
-        switch (contadorTensao) {
-            case 0: tensao = 127; break;
-            case 1: tensao = 220; break;
-            case 2: tensao = 0; break;
-        }
+    pinMode(PIN_BUTTON, INPUT_PULLUP);
+    pinMode(PIN_LED_220V, OUTPUT);
+    pinMode(PIN_LED_127V, OUTPUT);
+    pinMode(PIN_LED_OFF, OUTPUT);
 
-        atualizarLEDs();
-
-        if (tensao == 0) {
-            vermelhoDesligando = true;
-            tempoDesligamentoVermelho = millis();
-            Serial.println("LED OFF - aceso por 10s");
-        } else {
-            vermelhoDesligando = false;
-            digitalWrite(LED_OFF, LOW);
-        }
-
-        Serial.printf("Botao pressionado. Nova tensao: %d V\n", tensao);
-        delay(250);     // debounce
-    }
-
-    estadoBotaoAnterior = estadoBotaoAtual;
+    updateLEDIndicators();
+    Serial.println("Hardware initialized");
 }
 
-void atualizarLEDs() {
-    digitalWrite(LED_220V, LOW);
-    digitalWrite(LED_127V, LOW);
-    digitalWrite(LED_OFF, LOW);
+void setupWiFi()
+{
+    Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    if (tensao == 127) digitalWrite(LED_127V, HIGH);
-    else if (tensao == 220) digitalWrite(LED_220V, HIGH);
-    else digitalWrite(LED_OFF, HIGH);
-}
-
-void atualizarEnergia() {
-    // calcula Irms e energia com precisão por microssegundos
-    unsigned long long agoraMicro = micros();
-    unsigned long long deltaMicro = agoraMicro - ultimoTempoMicro;
-    ultimoTempoMicro = agoraMicro;
-
-    // Chamada principal para medição do SCT013
-    Irms = SCT013.calcIrms(2048);
-    
-    // Se a corrente for muito baixa (ruído), zera o valor
-    if (Irms < 0.16) Irms = 0.0;
-
-    double potencia = Irms * tensao;    // W
-
-    if (potencia > 0) {
-        // Wh = W * horas ; deltaMicro / 3.600.000.000 => horas
-        energia_Wh += (potencia * (deltaMicro / 3600000000.0));
-        consumoAtual_kWh = energia_Wh / 1000.0;
-    }
-
-    Serial.printf("Tensao: %d V | Irms: %.3f A | P: %.2f W | Hoje: %.6f kWh\n",
-                  tensao, Irms, potencia, consumoAtual_kWh);
-}
-
-// ---------- FIREBASE ----------
-void conectarWiFi() {
-    Serial.print("Conectando no WiFi ");
-    Serial.println(ssid);
-    WiFi.begin(ssid, password);
-
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000UL) {
+    unsigned long startTime = millis();
+    while (!isWiFiConnected() && millis() - startTime < WIFI_TIMEOUT_MS)
+    {
         delay(500);
         Serial.print(".");
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi conectado");
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("\nFalha ao conectar (prototipo).");
+
+    if (isWiFiConnected())
+    {
+        Serial.println("\nWiFi connected");
+        Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    }
+    else
+    {
+        Serial.println("\nWiFi connection failed");
     }
 }
 
-void enviarDadosFirebase() {
-    // prepara JSON
-    FirebaseJson json;
-    double potenciaW = Irms * tensao;
-
-    json.set("tensao", tensao);
-    json.set("corrente", Irms);
-    json.set("potencia", potenciaW); 
-    json.set("consumoAtual_kWh", consumoAtual_kWh);
-    json.set("idDispositivo", idDispositivo);
-    json.set("timestamp", gerarTimestampISO());
-
-    // Caminho ajustado para usar underscore: /leituras/leitura_1, leitura_2, etc.
-    String pathLeitura = "/leituras/leitura_" + String(contadorLeitura++);
-
-    Serial.print("Enviando leitura para ");
-    Serial.println(pathLeitura);
-
-    // Envia leitura para lista normal (Log)
-    if (Firebase.RTDB.setJSON(&fbdo, pathLeitura.c_str(), &json)) {
-        Serial.println("Leitura enviada com sucesso.");
-    } else {
-        Serial.println("Falha ao enviar leitura: " + fbdo.errorReason());
-    }
-
-    // Atualiza último valor (Snapshot)
-    if (!Firebase.RTDB.setJSON(&fbdo, "/ultima_leitura", &json)) {
-        Serial.println("Falha ao atualizar /ultima_leitura: " + fbdo.errorReason());
-    }
+void setupTimeSync()
+{
+    configTime(TIMEZONE_OFFSET_SECONDS, 0, "pool.ntp.org", "time.nist.gov");
+    waitForNTPSync();
 }
 
+void setupFirebase()
+{
+    Serial.println("Configuring Firebase...");
+    firebaseConfig.database_url = FIREBASE_HOST;
+    firebaseConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+    Firebase.begin(&firebaseConfig, &firebaseAuth);
+    Firebase.reconnectWiFi(true);
+    Serial.println("Firebase connected");
+}
 
-// ---------- FECHAMENTO DIÁRIO SEGURO ----------
-void verificarViradaDia() {
+// ============================================================================
+// TIME FUNCTION IMPLEMENTATIONS
+// ============================================================================
+
+void waitForNTPSync()
+{
+    Serial.print("Waiting for NTP synchronization");
     time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
 
-    // Verifica se o dia do mês mudou
-    if (t->tm_mday != diaAtual) {
-        // grava consumo do dia anterior
-        fechamentoDiario(consumoAtual_kWh);
-
-        // reseta contadores locais
-        consumoOntem_kWh = consumoAtual_kWh;
-        consumoAtual_kWh = 0.0;
-        energia_Wh = 0.0;
-
-        // atualiza diaAtual
-        diaAtual = t->tm_mday;
-
-        Serial.println("----- NOVO DIA ----- Consumo zerado.");
+    while (now < MIN_VALID_TIMESTAMP)
+    {
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
     }
+
+    Serial.println("\nNTP synchronized successfully");
 }
 
-// Fechamento que evita duplicidade via /ultimo_fechamento/data
-void fechamentoDiario(double consumoDia_kWh) {
-    // calcula data de ontem (YYYY-MM-DD)
-    time_t agora = time(nullptr);
-    struct tm tm_ontem = *localtime(&agora);
-    tm_ontem.tm_mday -= 1;
-    mktime(&tm_ontem);
+String getCurrentTimestamp()
+{
+    time_t now = time(nullptr);
+    struct tm *timeInfo = localtime(&now);
+
+    char buffer[25];
+    sprintf(buffer, "%04d-%02d-%02d %02d:%02d:%02d",
+            timeInfo->tm_year + 1900,
+            timeInfo->tm_mon + 1,
+            timeInfo->tm_mday,
+            timeInfo->tm_hour,
+            timeInfo->tm_min,
+            timeInfo->tm_sec);
+
+    return String(buffer);
+}
+
+String getCurrentDate()
+{
+    time_t now = time(nullptr);
+    struct tm *timeInfo = localtime(&now);
 
     char buffer[12];
     sprintf(buffer, "%04d-%02d-%02d",
-            tm_ontem.tm_year + 1900,
-            tm_ontem.tm_mon + 1,
-            tm_ontem.tm_mday);
+            timeInfo->tm_year + 1900,
+            timeInfo->tm_mon + 1,
+            timeInfo->tm_mday);
 
-    String dataOntem = String(buffer);
+    return String(buffer);
+}
 
-    // pega ultimaDataFechada local se ainda não tiver sido lida
-    if (ultimaDataFechada == "") {
-        // tenta ler do Firebase /ultimo_fechamento/data (string simples)
-        if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-            if (Firebase.RTDB.getString(&fbdo, "/ultimo_fechamento/data")) {
-                ultimaDataFechada = fbdo.stringData();
-                Serial.println("ultimo_fechamento/data lido: " + ultimaDataFechada);
-            } else {
-                Serial.println("Nenhum /ultimo_fechamento/data encontrado no Firebase.");
-            }
+String getYesterdayDate()
+{
+    time_t now = time(nullptr);
+    struct tm yesterday = *localtime(&now);
+    yesterday.tm_mday -= 1;
+    mktime(&yesterday);
+
+    char buffer[12];
+    sprintf(buffer, "%04d-%02d-%02d",
+            yesterday.tm_year + 1900,
+            yesterday.tm_mon + 1,
+            yesterday.tm_mday);
+
+    return String(buffer);
+}
+
+int getCurrentDay()
+{
+    time_t now = time(nullptr);
+    struct tm *timeInfo = localtime(&now);
+    return timeInfo->tm_mday;
+}
+
+// ============================================================================
+// HARDWARE CONTROL IMPLEMENTATIONS
+// ============================================================================
+
+void handleButtonPress()
+{
+    int currentButtonState = digitalRead(PIN_BUTTON);
+
+    // Detect button press (falling edge)
+    if (previousButtonState == HIGH && currentButtonState == LOW)
+    {
+        updateVoltageMode();
+        updateLEDIndicators();
+
+        // Handle LED OFF mode timer
+        if (currentVoltageMode == VOLTAGE_OFF)
+        {
+            isLedOffTimerActive = true;
+            ledOffStartTime = millis();
+            Serial.println("OFF mode - LED will turn off in 10 seconds");
         }
+        else
+        {
+            isLedOffTimerActive = false;
+            digitalWrite(PIN_LED_OFF, LOW);
+        }
+
+        Serial.printf("Voltage mode changed to: %d V\n", currentVoltageValue);
+        delay(250); // Debounce delay
     }
 
-    // evita duplicar
-    if (dataOntem == ultimaDataFechada) {
-        Serial.println("Fechamento diário já realizado para: " + dataOntem);
-        return;
+    previousButtonState = currentButtonState;
+}
+
+void updateVoltageMode()
+{
+    currentVoltageMode = (VoltageMode)(((int)currentVoltageMode + 1) % VOLTAGE_MODE_COUNT);
+    currentVoltageValue = getVoltageValue(currentVoltageMode);
+}
+
+void updateLEDIndicators()
+{
+    digitalWrite(PIN_LED_220V, LOW);
+    digitalWrite(PIN_LED_127V, LOW);
+    digitalWrite(PIN_LED_OFF, LOW);
+
+    switch (currentVoltageMode)
+    {
+    case VOLTAGE_127V:
+        digitalWrite(PIN_LED_127V, HIGH);
+        break;
+    case VOLTAGE_220V:
+        digitalWrite(PIN_LED_220V, HIGH);
+        break;
+    case VOLTAGE_OFF:
+        digitalWrite(PIN_LED_OFF, HIGH);
+        break;
+    }
+}
+
+void updateLEDOffTimer()
+{
+    if (isLedOffTimerActive && millis() - ledOffStartTime >= LED_OFF_DURATION_MS)
+    {
+        digitalWrite(PIN_LED_OFF, LOW);
+        isLedOffTimerActive = false;
+    }
+}
+
+// ============================================================================
+// ENERGY MEASUREMENT IMPLEMENTATIONS
+// ============================================================================
+
+void measureEnergy()
+{
+    // Calculate time delta with microsecond precision
+    unsigned long long currentMicros = micros();
+    unsigned long long deltaMicros = currentMicros - lastMicros;
+    lastMicros = currentMicros;
+
+    // Measure RMS current
+    currentRMS = currentSensor.calcIrms(ADC_SAMPLES);
+
+    // Filter noise
+    if (currentRMS < NOISE_THRESHOLD_AMPS)
+    {
+        currentRMS = 0.0;
     }
 
-    // cria JSON de fechamento
+    // Calculate and accumulate energy
+    double power = calculatePower();
+    if (power > 0)
+    {
+        double hours = deltaMicros / MICROS_PER_HOUR;
+        energyAccumulator_Wh += (power * hours);
+        todayConsumption_kWh = energyAccumulator_Wh / WH_TO_KWH;
+    }
+
+    Serial.printf("Voltage: %d V | Current: %.3f A | Power: %.2f W | Today: %.6f kWh\n",
+                  currentVoltageValue, currentRMS, power, todayConsumption_kWh);
+}
+
+double calculatePower()
+{
+    return currentRMS * currentVoltageValue;
+}
+
+// ============================================================================
+// FIREBASE IMPLEMENTATIONS
+// ============================================================================
+
+void sendReadingToFirebase()
+{
     FirebaseJson json;
-    json.set("consumo_kWh", consumoDia_kWh);
-    json.set("idDispositivo", idDispositivo);
-    json.set("timestamp", gerarTimestampISO());
+    double power = calculatePower();
 
-    String path = "/consumos_diarios/" + dataOntem;
+    json.set("tensao", currentVoltageValue);
+    json.set("corrente", currentRMS);
+    json.set("potencia", power);
+    json.set("consumoAtual_kWh", todayConsumption_kWh);
+    json.set("idDispositivo", DEVICE_ID);
+    json.set("timestamp", getCurrentTimestamp());
 
-    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-        if (Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
-            Serial.println("Fechamento diário enviado: " + path);
-            ultimaDataFechada = dataOntem;
-            // também atualiza um marcador simples para evitar duplicidade futura
-            if (!Firebase.RTDB.setString(&fbdo, "/ultimo_fechamento/data", dataOntem)) {
-                Serial.println("Aviso: não foi possível atualizar /ultimo_fechamento/data: " + fbdo.errorReason());
-            }
-        } else {
-            Serial.println("Falha ao enviar fechamento diário: " + fbdo.errorReason());
-        }
-    } else {
-        Serial.println("WiFi/Firebase indisponível: não foi possível enviar fechamento diário agora.");
+    // Send to readings log
+    String readingPath = "/leituras/leitura_" + String(readingCounter++);
+    Serial.printf("Sending reading to: %s\n", readingPath.c_str());
+
+    if (Firebase.RTDB.setJSON(&firebaseData, readingPath.c_str(), &json))
+    {
+        Serial.println("Reading sent successfully");
+    }
+    else
+    {
+        Serial.printf("Failed to send reading: %s\n", firebaseData.errorReason().c_str());
+    }
+
+    // Update latest reading snapshot
+    if (!Firebase.RTDB.setJSON(&firebaseData, "/ultima_leitura", &json))
+    {
+        Serial.printf("Failed to update latest reading: %s\n", firebaseData.errorReason().c_str());
     }
 }
 
-// Ao iniciar, fecha retroativamente se necessário usando /ultimo_fechamento/data
-void fechamentoRetroativoAoIniciar() {
-    Serial.println("Verificando fechamento retroativo ao iniciar...");
+void sendDailyClosingToFirebase(double consumption_kWh)
+{
+    FirebaseJson json;
+    json.set("consumo_kWh", consumption_kWh);
+    json.set("idDispositivo", DEVICE_ID);
+    json.set("timestamp", getCurrentTimestamp());
 
-    if (!(WiFi.status() == WL_CONNECTED && Firebase.ready())) {
-        Serial.println("Firebase não disponível no boot; pulando verificação retroativa.");
+    String date = getYesterdayDate();
+    String path = "/consumos_diarios/" + date;
+
+    if (Firebase.RTDB.setJSON(&firebaseData, path.c_str(), &json))
+    {
+        Serial.printf("Daily closing sent: %s\n", path.c_str());
+        updateLastClosedDateMarker(date);
+    }
+    else
+    {
+        Serial.printf("Failed to send daily closing: %s\n", firebaseData.errorReason().c_str());
+    }
+}
+
+bool readLastClosedDateFromFirebase()
+{
+    if (Firebase.RTDB.getString(&firebaseData, "/ultimo_fechamento/data"))
+    {
+        lastClosedDate = firebaseData.stringData();
+        Serial.printf("Last closed date from Firebase: %s\n", lastClosedDate.c_str());
+        return true;
+    }
+    else
+    {
+        Serial.println("No last closed date found in Firebase");
+        lastClosedDate = "";
+        return false;
+    }
+}
+
+void updateLastClosedDateMarker(const String &date)
+{
+    lastClosedDate = date;
+    if (!Firebase.RTDB.setString(&firebaseData, "/ultimo_fechamento/data", date))
+    {
+        Serial.printf("Warning: Failed to update last closed date marker: %s\n",
+                      firebaseData.errorReason().c_str());
+    }
+}
+
+// ============================================================================
+// DAY MANAGEMENT IMPLEMENTATIONS
+// ============================================================================
+
+void checkForDayRollover()
+{
+    int today = getCurrentDay();
+
+    if (today != currentDayOfMonth)
+    {
+        performDailyClosing(todayConsumption_kWh);
+
+        // Reset daily counters
+        yesterdayConsumption_kWh = todayConsumption_kWh;
+        todayConsumption_kWh = 0.0;
+        energyAccumulator_Wh = 0.0;
+        currentDayOfMonth = today;
+
+        Serial.println("===== NEW DAY ===== Consumption reset");
+    }
+}
+
+void performDailyClosing(double consumption_kWh)
+{
+    String yesterday = getYesterdayDate();
+
+    // Read last closed date if not already in memory
+    if (lastClosedDate.isEmpty() && isWiFiConnected() && isFirebaseReady())
+    {
+        readLastClosedDateFromFirebase();
+    }
+
+    // Prevent duplicate closings
+    if (yesterday == lastClosedDate)
+    {
+        Serial.printf("Daily closing already performed for: %s\n", yesterday.c_str());
         return;
     }
 
-    // ler string simples do Firebase com a última data fechada
-    if (Firebase.RTDB.getString(&fbdo, "/ultimo_fechamento/data")) {
-        ultimaDataFechada = fbdo.stringData();
-        Serial.println("Ultima data fechada (firebase): " + ultimaDataFechada);
-    } else {
-        Serial.println("Nenhum /ultimo_fechamento/data encontrado (firebase).");
-        ultimaDataFechada = "";
+    // Send closing to Firebase
+    if (isWiFiConnected() && isFirebaseReady())
+    {
+        sendDailyClosingToFirebase(consumption_kWh);
+    }
+    else
+    {
+        Serial.println("WiFi/Firebase unavailable - daily closing postponed");
+    }
+}
+
+void performRetroactiveClosing()
+{
+    Serial.println("Checking for retroactive closing...");
+
+    if (!isWiFiConnected() || !isFirebaseReady())
+    {
+        Serial.println("Firebase unavailable - skipping retroactive check");
+        return;
     }
 
-    // data de ontem
-    time_t agora = time(nullptr);
-    struct tm tm_ontem = *localtime(&agora);
-    tm_ontem.tm_mday -= 1;
-    mktime(&tm_ontem);
+    readLastClosedDateFromFirebase();
+    String yesterday = getYesterdayDate();
 
-    char buffer[12];
-    sprintf(buffer, "%04d-%02d-%02d",
-            tm_ontem.tm_year + 1900,
-            tm_ontem.tm_mon + 1,
-            tm_ontem.tm_mday);
-
-    String dataOntem = String(buffer);
-
-    if (dataOntem != ultimaDataFechada) {
-        Serial.println("Fechamento retroativo necessário para: " + dataOntem);
-        // usa o consumo atual armazenado localmente
-        fechamentoDiario(consumoAtual_kWh);
-    } else {
-        Serial.println("Nenhum fechamento retroativo necessário.");
+    if (yesterday != lastClosedDate)
+    {
+        Serial.printf("Retroactive closing needed for: %s\n", yesterday.c_str());
+        performDailyClosing(todayConsumption_kWh);
     }
+    else
+    {
+        Serial.println("No retroactive closing needed");
+    }
+}
+
+// ============================================================================
+// UTILITY FUNCTION IMPLEMENTATIONS
+// ============================================================================
+
+int getVoltageValue(VoltageMode mode)
+{
+    switch (mode)
+    {
+    case VOLTAGE_127V:
+        return 127;
+    case VOLTAGE_220V:
+        return 220;
+    case VOLTAGE_OFF:
+        return 0;
+    default:
+        return 127;
+    }
+}
+
+bool isWiFiConnected()
+{
+    return WiFi.status() == WL_CONNECTED;
+}
+
+bool isFirebaseReady()
+{
+    return Firebase.ready();
 }
